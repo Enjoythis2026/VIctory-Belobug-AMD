@@ -45,11 +45,18 @@ const CHUNK: usize = 1024;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        wanted() && crate::host::host().is_some() && crate::queue::line_on() && {
+        (wanted() || sync_translation()) && crate::host::host().is_some() && (sync_translation() || crate::queue::line_on()) && {
             start();
             true
         }
     })
+}
+
+/// Translate the title's recordings on workers, then wait for translation
+/// at ExecuteCommandLists and submit through the synchronous queue.
+pub(crate) fn sync_translation() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_TRANSLATE") && !crate::host::late() && crate::queue::cuts())
 }
 
 /// Whether it is asked for.

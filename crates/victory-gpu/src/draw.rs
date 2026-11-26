@@ -394,6 +394,7 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    incompatible_depth_target: bool,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -1170,6 +1171,23 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        self.incompatible_depth_target = dsv.as_ref().is_some_and(|(depth, record)| {
+            let Some(depth_size) = depth_target_size(depth, record.depth_desc().as_ref()) else {
+                return false;
+            };
+            views.iter().any(|(color, desc)| {
+                color
+                    .and_then(|color| color_target_size(color, desc.as_ref()))
+                    .is_some_and(|size| size.0 > depth_size.0 || size.1 > depth_size.1)
+            })
+        });
+        let dsv = if self.incompatible_depth_target {
+            once!("ignoring a depth target smaller than the color target; depth-dependent draws are skipped");
+            self.depth = 0;
+            None
+        } else {
+            dsv
+        };
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1538,6 +1556,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if !compute && self.incompatible_depth_target && p.requires_depth_target {
+            return false;
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2898,19 +2919,29 @@ impl State {
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
         };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+            once!(?role, "no stand-in for the indirect light: no output UAV");
             return false;
+        };
+        let depth = if role == Role::Resolve {
+            let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                once!("no stand-in for the indirect light: no depth SRV");
+                return false;
+            };
+            if (seen.Width, seen.Height) != (of.Width, of.Height) {
+                once!("no stand-in for the indirect light: depth and output sizes differ");
+                return false;
+            }
+            Some(depth)
+        } else {
+            // Radiance and Air use only the output UAV. Binding it in the
+            // unused depth parameter violates the root signature's SRV type.
+            None
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+        if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
@@ -2941,7 +2972,8 @@ impl State {
             return None;
         };
         let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-            View::Shader(r, _) | View::Unordered(r, ..) => r,
+            View::Shader(r, _) if kind == ResourceType::Srv => r,
+            View::Unordered(r, ..) if kind == ResourceType::Uav => r,
             _ => return None,
         };
         let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -4277,6 +4309,50 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
     }
+}
+
+/// Effective dimensions of the plain 2D color views used by the main pass.
+fn color_target_size(
+    texture: &ID3D12Resource,
+    view: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+) -> Option<(u64, u32)> {
+    let mip = match view {
+        None => 0,
+        // SAFETY: the view dimension selects the active union member.
+        Some(view) if view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D => unsafe {
+            view.Anonymous.Texture2D.MipSlice
+        },
+        _ => return None,
+    };
+    target_size(texture, mip)
+}
+
+/// Effective dimensions of the plain 2D depth views used by the main pass.
+fn depth_target_size(
+    texture: &ID3D12Resource,
+    view: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
+) -> Option<(u64, u32)> {
+    let mip = match view {
+        None => 0,
+        // SAFETY: the view dimension selects the active union member.
+        Some(view) if view.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D => unsafe {
+            view.Anonymous.Texture2D.MipSlice
+        },
+        _ => return None,
+    };
+    target_size(texture, mip)
+}
+
+fn target_size(texture: &ID3D12Resource, mip: u32) -> Option<(u64, u32)> {
+    // SAFETY: the caller holds a live resource.
+    let resource = unsafe { texture.GetDesc() };
+    if resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || resource.DepthOrArraySize != 1
+        || resource.SampleDesc.Count != 1
+    {
+        return None;
+    }
+    Some((resource.Width.checked_shr(mip).unwrap_or(0).max(1), resource.Height.checked_shr(mip).unwrap_or(0).max(1)))
 }
 
 /// The host state a depth view needs of its texture: the read state if the

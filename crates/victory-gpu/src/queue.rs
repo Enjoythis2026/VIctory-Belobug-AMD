@@ -581,7 +581,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             return;
         }
         if cuts() && !this.is_null() {
-            submit_cut(this, lists);
+            if crate::list::thin::sync_translation() && crate::list::thin::on() {
+                let recordings = crate::list::thin::submitted(lists);
+                let translated: Vec<_> = recordings.iter().map(|recording| {
+                    recording.wait();
+                    recording.back()
+                }).collect();
+                // The recordings own these lists until submit_cut has executed
+                // them or detached the parts that have to wait.
+                submit_cut(this, &translated);
+            } else {
+                submit_cut(this, lists);
+            }
             return;
         }
         if waits() && split() && !this.is_null() {
@@ -944,7 +955,15 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if frame.is_power_of_two() {
+    #[cfg(feature = "diagnostics")]
+    let record_every_thirty = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_FRAME_SAMPLES"))
+            && frame.is_multiple_of(30)
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let record_every_thirty = false;
+    if frame.is_power_of_two() || record_every_thirty {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
         let (drawn, dispatched) = {

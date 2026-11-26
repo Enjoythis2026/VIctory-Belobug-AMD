@@ -2168,6 +2168,8 @@ struct CardWork {
     /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
+    /// Optional local results. One contiguous copy publishes a submission's flags.
+    local_differs: Option<ID3D12Resource>,
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
     /// The dwords of `differs` taken by plans whose results were not read
@@ -2211,6 +2213,9 @@ ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 groupshared uint4 parts[64];
+#if defined(LANE_COMPARE) || defined(BYTE_COMPARE)
+groupshared uint changed;
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
@@ -2220,6 +2225,30 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
+#ifdef BYTE_COMPARE
+    // Adjacent pieces may share the 16-byte vector at an unaligned edge.
+    // Give each edge independent reference storage.
+    uint4 delta = 0u;
+    for (uint row = lo; row < hi; row += 1024u) {
+        uint pos = row + thread * 16u;
+        if (pos < hi) {
+            uint4 value = now.Load4(pos);
+#ifdef COPY_REFERENCE
+            uint addr = pos;
+#else
+            uint addr = pos + piece * 16u;
+#endif
+            if (compare == 0u) hashes.Store4(addr, value);
+            else delta |= value ^ hashes.Load4(addr);
+        }
+    }
+    if (compare == 0u) return;
+    if (thread == 0u) changed = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (any(delta)) InterlockedOr(changed, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (thread == 0u) differs.Store(out_at + id.x * 4u, changed);
+#else
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
     uint at = lo + thread * 16u;
     // Eight loads at once: one after the other, each waits for memory.
@@ -2255,6 +2284,20 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+#ifdef LANE_COMPARE
+    // Synchronous submissions only consume the changed bit. Comparing every
+    // lane before folding also detects any difference the old fold detects.
+    uint address = (piece * 64u + thread) * 16u;
+    if (compare == 0u) {
+        hashes.Store4(address, h);
+        return;
+    }
+    if (thread == 0u) changed = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (any(hashes.Load4(address) != h)) InterlockedOr(changed, 1u);
+    GroupMemoryBarrierWithGroupSync();
+    if (thread == 0u) differs.Store(out_at + id.x * 4u, changed);
+#else
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
     if (thread != 0u) return;
@@ -2274,8 +2317,25 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     } else {
         hashes.Store4(piece * 16u, h);
     }
+#endif
+#endif
 }
 "#;
+
+pub(crate) fn lane_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !late() && crate::switch::on("VICTORY_LANE_COMPARE"))
+}
+
+pub(crate) fn byte_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !late() && crate::switch::on("VICTORY_COMPARE_BYTES"))
+}
+
+fn copy_reference() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| byte_compare() && !send::own() && !upcheck::on() && crate::switch::on("VICTORY_COPY_REFERENCE"))
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
@@ -2422,6 +2482,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    closed_front: Option<std::sync::Arc<ListFront>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -4393,12 +4454,21 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = if copy_reference() {
+            format!("#define BYTE_COMPARE 1\n#define COPY_REFERENCE 1\n{CARD_COMPARE}")
+        } else if byte_compare() {
+            format!("#define BYTE_COMPARE 1\n{CARD_COMPARE}")
+        } else if lane_compare() {
+            format!("#define LANE_COMPARE 1\n{CARD_COMPARE}")
+        } else {
+            CARD_COMPARE.to_owned()
+        };
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4439,6 +4509,7 @@ impl Host {
                 root,
                 pso,
                 differs: (differs, data as usize, RESULTS),
+                local_differs: if !late() && crate::switch::on("VICTORY_LOCAL_FLAGS") { self.uav_buffer(RESULTS) } else { None },
                 fetched: None,
                 taken: 0,
                 out: 0,
@@ -4458,7 +4529,7 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool, submitted: &mut u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4490,7 +4561,19 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+        static DIRECT_LIMIT: OnceLock<u64> = OnceLock::new();
+        let limit = *DIRECT_LIMIT.get_or_init(|| {
+            if late() || crate::picked::on() {
+                return 0;
+            }
+            std::env::var("VICTORY_DIRECT_FETCH_KIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).saturating_mul(1024)
+        });
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
+            // Without a hash buffer, card_back fetches every declared byte and
+            // performs the usual exact merge on the CPU.
+            if limit != 0 && shadow.span().1 <= limit {
+                continue;
+            }
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -4580,7 +4663,7 @@ impl Host {
                                 sent.push(transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    if copy_reference() { D3D12_RESOURCE_STATE_COPY_SOURCE } else { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE },
                                 ));
                             }
                         }
@@ -4601,8 +4684,10 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        if !copy_reference() {
+                            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        }
                         let joins = rehash_runs() || own.is_some();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
@@ -4623,11 +4708,34 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
+                            if copy_reference() {
+                                if run.pieces > 0 {
+                                    let (lo, _) = shadow.card_hashed(run.first);
+                                    let (_, hi) = shadow.card_hashed(run.first + run.pieces - 1);
+                                    if hi > lo {
+                                        list.CopyBufferRegion(&before, lo as u64, &shadow.buffer, lo as u64, (hi - lo) as u64);
+                                    }
+                                }
+                            } else {
+                                card_pass(list, &run, size as u32, 0, 0);
+                            }
                         }
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_FENCE_CHECKPOINTS") {
+                        *submitted += 1;
+                        let checkpoint = *submitted;
+                        self.queue.Signal(&self.fence, checkpoint)?;
+                        self.fence.SetEventOnCompletion(checkpoint, self.event)?;
+                        let wait = WaitForSingleObject(self.event, INFINITE);
+                        let completed = self.fence.GetCompletedValue();
+                        self.device.GetDeviceRemovedReason()?;
+                        if wait.0 != 0 || completed < checkpoint || completed == u64::MAX {
+                            fail(format_args!("GPU buffer upload checkpoint {checkpoint} did not finish: wait={wait:?}, fence={completed}"));
+                        }
+                        tracing::debug!(target: "victory_gpu::checkpoint", checkpoint, buffers = dirty.len(), "GPU buffer upload batch completed");
+                    }
                     Ok(())
                 })()
             };
@@ -4649,7 +4757,8 @@ impl Host {
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        let first_result = work.taken;
+        let mut at = first_result;
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -4721,7 +4830,8 @@ impl Host {
                     }]);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    let output = work.local_differs.as_ref().unwrap_or(&work.differs.0);
+                    list.SetComputeRootUnorderedAccessView(3, output.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
@@ -4732,6 +4842,11 @@ impl Host {
                         // changed there is the next declared range's to land.)
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(flags) = &work.local_differs {
+                        list.ResourceBarrier(&[transition(flags, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        let offset = u64::from(first_result) * 4;
+                        list.CopyBufferRegion(&work.differs.0, offset, flags, offset, u64::from(at - first_result) * 4);
                     }
                     list.Close()?;
                     list.cast()
@@ -5287,7 +5402,15 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    // Consecutive pieces of a range are packed consecutively in
+                    // the fetch buffer. Keep their individual merge boundaries.
+                    let mut runs = pieces.iter().copied().peekable();
+                    while let Some((i, lo, mut hi, at)) = runs.next() {
+                        while let Some((_, _, end, _)) = runs.next_if(|&(j, start, _, dst)| {
+                            j == i && start == hi && dst == at + (hi - lo) as u64
+                        }) {
+                            hi = end;
+                        }
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
@@ -5313,7 +5436,14 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
+            let parallel = wide_merge() && pieces.len() >= 8 && {
+                // Distinct host buffers can be views of the same title address.
+                // Keep the serial merge order if two declared ranges overlap.
+                let mut ranges: Vec<_> = plan.ranges.iter().filter(|r| !r.picked).map(|r| r.declared).collect();
+                ranges.sort_unstable();
+                ranges.windows(2).all(|w| w[0].1 <= w[1].0)
+            };
+            if parallel {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
@@ -5560,19 +5690,25 @@ impl Host {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the fence and event are ours, under the
                 // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            #[cfg(feature = "diagnostics")]
-                            let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                let wait = unsafe {
+                    self.fence.SetEventOnCompletion(*submitted, self.event).map(|()| {
+                        working(false);
+                        #[cfg(feature = "diagnostics")]
+                        let _card = crate::timeline::card_wait(Some(*submitted));
+                        let result = WaitForSingleObject(self.event, INFINITE);
+                        stood(waiting);
+                        working(true);
+                        result
+                    })
+                };
+                // A removal wakes fence events and returns UINT64_MAX.
+                // Only a successful wait on a real fence value may retire work.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                let removed = unsafe { self.device.GetDeviceRemovedReason() }.is_err();
+                let finished = wait.as_ref().is_ok_and(|status| status.0 == 0)
+                    && completed != u64::MAX
+                    && completed >= *submitted
+                    && !removed;
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5581,8 +5717,7 @@ impl Host {
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
                 });
-                // SAFETY: a plain query.
-                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                if !finished {
                     let runs: Vec<&HostList> = items
                         .iter()
                         .filter_map(|i| match i {
@@ -5592,7 +5727,7 @@ impl Host {
                         .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
                         .collect();
                     fail(format_args!(
-                        "host GPU device removed after {flights} submissions sent ahead (VICTORY_LATE_WAIT=1) of {} lists{}{}",
+                        "GPU wait did not confirm {flights} deferred submissions of {} lists (expected fence {submitted}, got {completed}; wait={wait:?}){}{}",
                         runs.len(),
                         self.removal_data(&runs),
                         last_notes(&runs)
@@ -5928,7 +6063,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let card = self.card_before(&declared, &picked, flown, &mut submitted);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -5974,13 +6109,69 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            let mut cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // Submit the buffer comparison after the title work. Buffers can
+            // decay from an implicitly promoted copy state at this boundary.
+            if let Some(check) = card.as_ref().and_then(|plan| plan.check.as_ref())
+                && let Some(compare) = lists.iter().position(|list| list.as_ref() == Some(check))
+                && compare > 0 && cuts.last().copied() != Some(compare)
+            {
+                cuts.push(compare);
+            }
+            if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_FENCE_CHECKPOINT_LISTS") {
+                if crate::switch::on("VICTORY_FENCE_CHECKPOINT_PRELUDES") {
+                    cuts.extend(1..lists.len());
+                } else {
+                    cuts.extend(firsts.iter().copied().filter(|&first| first > 0));
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
+                let checkpoints = cfg!(feature = "diagnostics")
+                    && crate::switch::on("VICTORY_FENCE_CHECKPOINTS");
+                if checkpoints {
+                    // A new value for each batch. The final signal still
+                    // owns the value that the deferred flight publishes.
+                    *submitted -= 1;
+                }
                 for to in cuts.into_iter().chain([lists.len()]) {
+                    if from == to {
+                        continue;
+                    }
                     self.queue.ExecuteCommandLists(&lists[from..to]);
+                    if checkpoints {
+                        *submitted += 1;
+                        let checkpoint = *submitted;
+                        let waited = self.queue.Signal(&self.fence, checkpoint)
+                            .and_then(|()| self.fence.SetEventOnCompletion(checkpoint, self.event));
+                        let completed = match waited {
+                            Ok(()) => {
+                                let wait = WaitForSingleObject(self.event, INFINITE);
+                                if wait.0 != 0 {
+                                    fail(format_args!("GPU checkpoint {checkpoint} wait failed for lists {from}..{to}: {wait:?}"));
+                                }
+                                self.fence.GetCompletedValue()
+                            }
+                            Err(e) => fail(format_args!(
+                                "GPU checkpoint {checkpoint} could not be armed for lists {from}..{to}: {e}{}{}",
+                                self.removal_data(runs), last_notes(runs)
+                            )),
+                        };
+                        if completed == u64::MAX || completed < checkpoint || self.device.GetDeviceRemovedReason().is_err() {
+                            fail(format_args!(
+                                "GPU checkpoint {checkpoint} did not complete for lists {from}..{to} of submission {this_submission}; title list indices {firsts:?}; fence reported {completed}{}{}",
+                                self.removal_data(runs), last_notes(runs)
+                            ));
+                        }
+                        tracing::debug!(target: "victory_gpu::checkpoint", checkpoint, from, to, submission = this_submission, "GPU batch completed");
+                    }
                     from = to;
+                }
+                if checkpoints {
+                    *submitted += 1;
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6550,6 +6741,10 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        if closed_plan() && refresh_front() {
+            let mut deferred = self.deferred();
+            deferred.closed_front = Some(std::sync::Arc::new(list_front(&deferred.copies, wide_textures())));
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7070,7 +7265,7 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        if !dred_on() && !timing() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -7083,12 +7278,11 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                // SAFETY: an open list, and SetMarker copies the UTF-16 text.
+                unsafe { self.list.SetMarker(0, Some(text.as_ptr().cast()), 2 * text.len() as u32) };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -8033,9 +8227,14 @@ fn ahead_of_writes() -> bool {
 /// earlier than its step: the title's bytes are the same until a step writes
 /// title memory, and behind such a step everything is asked for again, as it
 /// was.
+fn closed_plan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CLOSED_PLAN"))
+}
+
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+    ahead_of_writes() && (closed_plan() || joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }
 
 /// Per copy what is refreshed in front of a submission's steps, as
@@ -8194,14 +8393,14 @@ fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>,
 }
 
 /// [`join_keys`] of the lists' parts, with their copies.
-fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+fn join_fronts<F: std::borrow::Borrow<ListFront>>(fronts: &[F], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     for front in fronts {
-        for (key, shadow) in &front.shadows {
+        for (key, shadow) in &front.borrow().shadows {
             shadows.entry(*key).or_insert_with(|| shadow.clone());
         }
     }
-    join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts)
+    join_keys(fronts.iter().map(|f| f.borrow().copies.as_slice()), parts)
         .into_iter()
         .filter_map(|(key, from, to)| Some((shadows.remove(&key)?, from, to)))
         .collect()
@@ -8476,6 +8675,23 @@ impl Batch {
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         let mut planning = crate::timeline::span("refreshes in front: the steps gathered");
         let mut due = Vec::new();
+        if closed_plan() {
+            let fronts: Vec<_> = runs.iter().map(|list| {
+                let deferred = list.deferred();
+                deferred.closed_front.clone().unwrap_or_else(|| {
+                    std::sync::Arc::new(list_front(&deferred.copies, wide_textures()))
+                })
+            }).collect();
+            for front in &fronts {
+                for staging in &front.textures {
+                    if self.texture_due(staging) {
+                        due.push(staging.clone());
+                    }
+                }
+            }
+            self.refresh_spans(join_fronts(&fronts, parts), due, planning);
+            return;
+        }
         // Renderer port #6: each list's part made on the threads beside, and
         // joined here in order (`list_front`, `join_fronts`): one submission
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
@@ -9305,6 +9521,13 @@ impl Meter {
         }
         self.last_present = status;
         if status != S_OK {
+            #[cfg(feature = "diagnostics")]
+            if status == windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+                static PROFILE: OnceLock<bool> = OnceLock::new();
+                if *PROFILE.get_or_init(|| crate::switch::on("VICTORY_PROFILE_OCCLUDED")) {
+                    self.frame(hwnd);
+                }
+            }
             return false;
         }
         self.frame(hwnd);

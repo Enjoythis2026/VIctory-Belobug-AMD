@@ -426,17 +426,16 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
-    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    drop(adopted);
     {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
-        *by.entry(writer.clone()).or_default() += 1;
+        *by.entry(rip).or_default() += 1;
     }
     if should_warn_missed(n) {
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),
-            %writer,
+            writer = %writer_name(rip),
             "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
         );
     }
@@ -532,7 +531,18 @@ pub(crate) static CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: view records the fallback found that no mark told of.
 static MISSED_ALL: AtomicU64 = AtomicU64::new(0);
 /// Since the start: the missed records by the place that last faulted on their block.
-static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static WRITERS: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn writer_name(rip: usize) -> String {
+    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+    if rip >= base && rip - base < size {
+        format!("title+{:#x}", rip - base)
+    } else if rip != 0 {
+        format!("{rip:#x} (not the title's)")
+    } else {
+        "not known (no fault on its block)".into()
+    }
+}
 /// Since the start: slots taken, of them marked by our calls; pages checked.
 static ALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -554,9 +564,10 @@ pub(crate) fn line(frames: f64) {
     }
     let writers = {
         let by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
-        let mut v: Vec<(&String, &u64)> = by.iter().collect();
-        v.sort_by(|a, b| b.1.cmp(a.1));
-        v.iter().take(6).map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+        let mut v: Vec<_> = by.iter().map(|(&rip, &count)| (rip, count)).collect();
+        drop(by);
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.into_iter().take(6).map(|(rip, n)| format!("{} {n}", writer_name(rip))).collect::<Vec<_>>().join(", ")
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \

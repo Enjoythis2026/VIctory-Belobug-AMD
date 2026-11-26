@@ -151,6 +151,10 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    fn requires_depth_target(&self) -> bool {
+        self.depth.DepthEnable.as_bool() || self.depth.StencilEnable.as_bool() || self.depth_bounds
+    }
+
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
     /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
@@ -381,6 +385,8 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    /// Whether graphics draws need a compatible depth/stencil attachment.
+    pub(crate) requires_depth_target: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -638,6 +644,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                requires_depth_target: false,
                 pso,
                 root,
                 stages: bound,
@@ -691,6 +698,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                requires_depth_target: g.requires_depth_target(),
                 pso,
                 root,
                 stages: bound,
@@ -807,6 +815,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            requires_depth_target: g.requires_depth_target(),
             pso,
             root,
             stages: bound,

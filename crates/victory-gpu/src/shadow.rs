@@ -351,11 +351,15 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
-/// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// Reference storage for the active comparison shader. Leave room for
+/// partial pieces at unaligned ends. The byte comparator also needs
+/// independent storage for a vector shared by adjacent pieces.
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    if crate::host::byte_compare() {
+        return size.next_multiple_of(16) + (size / PIECE as u64 + 2) * 16;
+    }
+    let hashes_per_piece = if crate::host::lane_compare() { 64 } else { 1 };
+    (size / PIECE as u64 + 2) * 16 * hashes_per_piece
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -4599,7 +4603,6 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
@@ -4608,16 +4611,14 @@ impl Shadow {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
-            let was = title.clone();
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+            for ((t, g), o) in title.iter().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
                 differs |= merged ^ *t;
-                *t = merged;
                 *o = merged;
             }
             if differs != 0 {
-                written = put_changed(start + at, &was, title);
+                written = put_changed(start + at, title, old);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
