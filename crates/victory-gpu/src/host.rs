@@ -6223,6 +6223,7 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
+        awake::sent(&self.device);
         submitting(2, runs.len());
         for (_i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;

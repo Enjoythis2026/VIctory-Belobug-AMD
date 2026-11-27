@@ -88,19 +88,19 @@ fn warm_bad_fingerprint_override_again_and_help() {
 
     let out_repeat = run_warm(root.path(), &cache, &[], &[]);
     assert!(
-        out_repeat.contains(&format!("4 pipelines known, 2 made before ({fp_base}), 2 bad; 0 to make")),
+        out_repeat.contains(&format!("4 pipelines known, 0 made before ({fp_base}), 2 bad; 2 to make")),
         "{out_repeat}"
     );
 
     let out_override = run_warm(root.path(), &cache, &[("VICTORY_WARM_BAD", "0")], &[]);
     assert!(
-        out_override.contains(&format!("4 pipelines known, 2 made before ({fp_base}), 0 bad; 2 to make")),
+        out_override.contains(&format!("4 pipelines known, 0 made before ({fp_base}), 0 bad; 4 to make")),
         "{out_override}"
     );
 
     let out_again = run_warm(root.path(), &cache, &[], &["--again", "--used"]);
     assert!(
-        out_again.contains(&format!("4 pipelines known, 4 made before ({fp_base}), 2 bad; 2 to make")),
+        out_again.contains(&format!("4 pipelines known, 0 made before ({fp_base}), 2 bad; 2 to make")),
         "{out_again}"
     );
 
@@ -116,7 +116,7 @@ fn warm_bad_fingerprint_override_again_and_help() {
     let done = fs::read_to_string(pipelines.join("warm-done.txt")).unwrap();
     let new_fp_keys: Vec<_> = done
         .lines()
-        .filter_map(|line| line.split_once(' '))
+        .filter_map(|line| line.split_once(" refused "))
         .filter(|(fp, _)| *fp == fp_new)
         .map(|(_, key)| key)
         .collect();

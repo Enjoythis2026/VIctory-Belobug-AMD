@@ -3317,7 +3317,7 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let later = !for_draw && (view.defer_until_use() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -4510,24 +4510,13 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
-                static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
-                static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
-                    tracing::warn!(
-                        address = format_args!("{at:#x}"),
-                        times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
-                    );
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if address != 0 {
+                    if *unordered {
+                        once!(address, ?resource, ?desc, "could not resolve placed texture UAV");
+                    } else {
+                        once!(address, ?resource, ?desc, "could not resolve placed texture SRV");
+                    }
                 }
                 return None;
             }
@@ -4915,20 +4904,26 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// Resolve both view types through the same placed resource. UAV words use
+/// a different union layout and must never be interpreted as SRV mip limits.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let allow_uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+    if resource[0] == BUFFER || address == 0 || (*unordered && resource[12] & allow_uav == 0) {
         return None;
     }
-    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let words = Some(desc[..10].try_into().ok()?);
+    if *unordered {
+        Some(View::Unordered(texture, 0, words))
+    } else {
+        crate::resource::want_level(texture as crate::object::This, crate::resource::first_mip(desc));
+        Some(View::Shader(texture, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -5157,6 +5152,80 @@ mod tests {
             assert!(neutral_for(&view(9), at).is_none());
             assert!(neutral_for(&view(8), at).is_none());
             assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn placed_texture_uav_writes_reach_the_readable_resource() {
+        let Some(host) = host() else {
+            eprintln!("skipping placed texture readback: no D3D12 device");
+            return;
+        };
+        // The placed-resource registry retains this allocation for the run.
+        let backing = Box::leak(Box::new([0u32; 64 * 64]));
+        let address = backing.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 42, 1, 0, 0, 4, 0];
+        let placed = |write: bool, address: u64| {
+            let mut words = [0; 16];
+            words[0] = 42; // R32_UINT
+            words[1] = 4; // TEXTURE2D
+            if !write {
+                words[2] = 5768;
+                words[5] = 1;
+            }
+            words[10] = address as u32;
+            words[11] = (address >> 32) as u32;
+            View::Placed(write, resource, words)
+        };
+        assert!(placed_texture(&placed(true, 0)).is_none());
+        assert!(placed_texture(&placed(false, 0)).is_none());
+        let writable = placed(true, address);
+        let readable = placed(false, address);
+        let View::Placed(_, mut read_only, words) = writable.clone() else { unreachable!() };
+        read_only[12] = 0;
+        assert!(placed_texture(&View::Placed(true, read_only, words)).is_none());
+        assert!(!writable.defer_until_use());
+        assert!(readable.defer_until_use());
+        let heap = HostHeap::new(false, 2).unwrap();
+        // D3D12 clears need a CPU-only descriptor as well as the visible one.
+        // SAFETY: both descriptors name the same live texture. The readback
+        // is mapped only after the list has finished.
+        unsafe {
+            let cpu: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            }).unwrap();
+            let handle = cpu.GetCPUDescriptorHandleForHeapStart();
+            let written = make(&writable, handle).unwrap().unwrap();
+            let mut slot = [0u64; 4];
+            let slot = slot.as_mut_ptr() as u64;
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &words, slot);
+            heap.mirror(0, slot, false);
+            assert_eq!(heap.shows(0, &written), Some(true));
+            let read = make(&readable, heap.cpu(1)).unwrap().unwrap();
+            assert_eq!(written, read);
+            let list = host.new_list().unwrap();
+            let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let cmds = &list.list;
+            cmds.ResourceBarrier(&[crate::host::transition(&written, D3D12_RESOURCE_STATE_COMMON, uav)]);
+            cmds.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            let value = 0x735a_981d;
+            cmds.ClearUnorderedAccessViewUint(heap.gpu_handle(0), handle, &written, &[value; 4], &[]);
+            cmds.ResourceBarrier(&[crate::host::transition(&read, uav, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let (buffer, footprint) = crate::capture::read_back(&host.device, cmds, &read).unwrap();
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            for row in 0..64 {
+                let offset = footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize;
+                let start = data.cast::<u8>().add(offset).cast::<u32>();
+                assert!(std::slice::from_raw_parts(start, 64).iter().all(|&pixel| pixel == value));
+            }
+            buffer.Unmap(0, None);
         }
     }
 

@@ -1753,7 +1753,7 @@ pub(crate) fn host_made<'a>(
 
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
-/// reported budget so 4–6 GiB cards do not bypass the budget check early.
+/// reported budget so 4Ã¢â‚¬â€œ6 GiB cards do not bypass the budget check early.
 #[cfg(any(windows, test))]
 fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     const MAX_FLOOR: u64 = 2 << 30;
@@ -3132,6 +3132,30 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    if address == 0 {
+        return None;
+    }
+    // The registry owns one permanent title object per placed allocation.
+    // Cache that identity only. Host copies, residency and view mip ranges
+    // are still checked at use. Comparing the raw words also preserves the
+    // filler diagnostics for each new description.
+    type Entry = (u64, [u32; 14], usize);
+    thread_local! {
+        static RECENT: [std::cell::Cell<Entry>; 64] =
+            const { [const { std::cell::Cell::new((0, [0; 14], 0)) }; 64] };
+    }
+    let slot = ((address >> 8) ^ (address >> 16) ^ (address >> 24)) as usize & 63;
+    let (old_address, old_desc, object) = RECENT.with(|cache| cache[slot].get());
+    if address == old_address && *desc == old_desc {
+        return Some(object as This);
+    }
+    let object = lookup_placed_texture(address, desc)?;
+    RECENT.with(|cache| cache[slot].set((address, *desc, object as usize)));
+    Some(object)
+}
+
+#[cfg(windows)]
+fn lookup_placed_texture(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -4648,6 +4672,21 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn placed_lookup_checks_the_description_on_cached_address_hits() {
+        let backing = Box::leak(Box::new([0u8; 4096]));
+        let address = backing.as_ptr() as u64;
+        let mut desc = [3, 0, 0, 0, 16, 0, 16, 0x1_0001, 42, 1, 0, 0, 4, 0];
+        let first = texture_at(address, &desc).unwrap();
+        assert_eq!(texture_at(address, &desc), Some(first));
+        desc[4] = 8;
+        assert_ne!(texture_at(address, &desc).unwrap(), first);
+        desc[4] = 16;
+        assert_eq!(texture_at(address, &desc), Some(first));
+        assert!(texture_at(0, &desc).is_none());
     }
 
     /// A placed texture viewed from a later level has a host copy of that

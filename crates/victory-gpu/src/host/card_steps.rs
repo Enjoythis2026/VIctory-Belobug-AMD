@@ -3,6 +3,7 @@
 //! CPU after a wait for them (`VICTORY_CARD_STEPS`, see [`stage`]).
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use super::*;
 use crate::shadow::Shadow;
@@ -776,6 +777,33 @@ impl Host {
                 level,
                 to,
             });
+        }
+        // The staged bytes feed copies and descriptor slots. If any source or
+        // destination is out of range, leave the whole plan to the normal path
+        // before recording refreshes, publishing slots, or marking GPU writes.
+        for op in &ops {
+            let len = op.len as u64;
+            let from = &op.from.0;
+            let fits = |buffer: &ID3D12Resource, offset: u64| {
+                // SAFETY: ops retains the resource throughout this check.
+                let width = unsafe { buffer.GetDesc() }.Width;
+                offset.checked_add(len).is_some_and(|end| end <= width)
+            };
+            let valid_destination = match &op.to {
+                To::Copy(to, dst) => fits(&to.buffer, to.offset(*dst as u64)),
+                To::Buffer(buffer) => fits(buffer, 0),
+                To::Slot(..) => true,
+            };
+            if !valid_destination || !fits(&from.buffer, from.offset(op.from.1 as u64))
+                || op.at.checked_add(len).is_none_or(|end| end > BETWEEN)
+            {
+                static REJECTED: AtomicU64 = AtomicU64::new(0);
+                let count = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 16 || count.is_power_of_two() {
+                    tracing::warn!(count, len, source = op.from.1, staging_offset = op.at, "card step outside its buffer; using the normal path");
+                }
+                return Err("card step outside its buffer");
+            }
         }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {

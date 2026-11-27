@@ -1046,13 +1046,13 @@ pub(crate) enum View {
 }
 
 impl View {
-    /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
+    /// Defer buffers to their refresh pass and placed SRVs to texture streaming.
+    /// A directly indexed texture UAV needs its descriptor on the first write.
     #[cfg(windows)]
-    fn is_buffer(&self) -> bool {
+    fn defer_until_use(&self) -> bool {
         match self {
-            View::Constant(..) | View::Placed(..) => true,
+            View::Constant(..) | View::Placed(false, ..) => true,
+            View::Placed(true, resource, _) => resource[0] == 1,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
